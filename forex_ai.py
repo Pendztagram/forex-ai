@@ -688,6 +688,8 @@ with st.sidebar:
     pair = st.selectbox("Pair", list(PAIRS))
     tf = st.selectbox("Timeframe", list(TIMEFRAMES), index=1)
     dark = st.toggle("Tema grafik gelap", value=True)
+    lock_chart = st.toggle("Kunci grafik level entri", value=True,
+                           help="Mencegah grafik bergeser atau zoom saat Anda menggulir layar di HP.")
     sl_mult = st.slider("Jarak stop loss (× ATR)", 0.5, 3.0, 1.0, 0.1,
                         help="Makin kecil, SL makin dekat. ATR di timeframe besar nilainya besar.")
     rr = st.slider("Target risk:reward", 1.0, 4.0, 2.0, 0.5,
@@ -786,7 +788,8 @@ def analysis_panel():
         fig_fx.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10),
                              yaxis_title="Perubahan 20 candle (%)")
         ca, cb = st.columns([3, 2])
-        ca.plotly_chart(fig_fx, use_container_width=True)
+        ca.plotly_chart(fig_fx, use_container_width=True,
+                        config={"staticPlot": lock_chart, "displayModeBar": not lock_chart})
         if fx["dxy"]:
             cb.metric("Indeks dolar (DXY)", fx["dxy"][1], f"skor robot {fx['dxy'][0]}", delta_color="off")
         else:
@@ -805,7 +808,8 @@ def analysis_panel():
         st.caption(f"Zona merah = risiko (entri ke SL), zona hijau = target (entri ke TP2). Arah: {lv['dir']}.")
     else:
         st.caption("Sinyal netral: tidak ada level entri. Hanya support dan resistance terdekat yang ditampilkan.")
-    st.plotly_chart(build_chart(data, pair, lv), use_container_width=True)
+    st.plotly_chart(build_chart(data, pair, lv), use_container_width=True,
+                    config={"staticPlot": lock_chart, "displayModeBar": not lock_chart})
 
     st.subheader("Perbandingan dengan sinyal TradingView")
     if tv is None:
