@@ -663,7 +663,196 @@ def robot_panel(pair, tf, decision, lv, price, modal, kurs, risk_pct, units, act
                "di robot_state.json di folder aplikasi (di hosting gratis bisa hilang saat aplikasi restart, jadi unduh CSV-nya).")
 
 
-def build_chart(df, name, lv=None):
+def swing_points(d, window=5):
+    H, L = d["High"].values, d["Low"].values
+
+    def pick(arr, fn):
+        out = []
+        for i in range(window, len(d) - window):
+            # abaikan swing kembar yang berdempetan (harga sama di candle bersebelahan)
+            if arr[i] == fn(arr[i - window:i + window + 1]) and (not out or i - out[-1] >= window):
+                out.append(i)
+        return out
+
+    return pick(H, max), pick(L, min)
+
+
+def cluster_levels(vals, tol):
+    """Gabungkan swing yang berdekatan menjadi zona: (harga rata-rata, jumlah sentuhan)."""
+    groups = []
+    for v in sorted(vals):
+        if groups and abs(v - sum(groups[-1]) / len(groups[-1])) <= tol:
+            groups[-1].append(v)
+        else:
+            groups.append([v])
+    return [(sum(g) / len(g), len(g)) for g in groups]
+
+
+def tech_reading(df):
+    """Robot membaca candlestick, support/resistance, trendline, MA, RSI, dan Bollinger Bands."""
+    d = df.tail(150)
+    n = len(d)
+    if n < 25:
+        return {"rows": [], "score": 0, "total": 0, "lines": [], "summary": "Data terlalu sedikit untuk dibaca."}
+    r = d.iloc[-1]
+    price, atr = r.Close, r.ATR
+    H, L, C = d["High"].values, d["Low"].values, d["Close"].values
+    hi, lo = swing_points(d)
+    rows, lines = [], []
+    label = {1: "Bullish", -1: "Bearish", 0: "Netral"}
+    clip = lambda x: max(-1, min(1, x))
+
+    def add(komponen, temuan, bias):
+        rows.append({"Komponen": komponen, "Temuan": temuan, "Arah": label[clip(bias)]})
+
+    # 1. Candlestick
+    pats = []
+    single = candle_pattern(d)
+    if single:
+        pats.append(single)
+    a, b2, c2 = d.iloc[-3], d.iloc[-2], d.iloc[-1]
+    ra, rb, rc = a.High - a.Low, b2.High - b2.Low, c2.High - c2.Low
+    if ra and rb:
+        small = abs(b2.Close - b2.Open) < 0.35 * rb
+        if a.Close < a.Open and abs(a.Close - a.Open) > 0.5 * ra and small \
+                and c2.Close > c2.Open and c2.Close > (a.Open + a.Close) / 2:
+            pats.append(("Morning star (pembalikan naik)", 1))
+        if a.Close > a.Open and abs(a.Close - a.Open) > 0.5 * ra and small \
+                and c2.Close < c2.Open and c2.Close < (a.Open + a.Close) / 2:
+            pats.append(("Evening star (pembalikan turun)", -1))
+    if rc and abs(c2.Close - c2.Open) > 0.85 * rc:
+        up = c2.Close > c2.Open
+        pats.append(("Marubozu bullish (momentum beli kuat)" if up else "Marubozu bearish (momentum jual kuat)",
+                     1 if up else -1))
+    if pats:
+        add("Candlestick", "; ".join(p[0] for p in pats), sum(p[1] for p in pats))
+    else:
+        add("Candlestick", "Tidak ada pola khusus pada 3 candle terakhir", 0)
+
+    # 2. Support / resistance
+    zones = cluster_levels([H[i] for i in hi] + [L[i] for i in lo], 0.5 * atr)
+    sup = sorted((z for z in zones if z[0] < price), key=lambda z: price - z[0])
+    res = sorted((z for z in zones if z[0] > price), key=lambda z: z[0] - price)
+    parts, bias = [], 0
+    if sup:
+        parts.append(f"support {sup[0][0]:.5f} ({sup[0][1]} sentuhan, {(price - sup[0][0]) / atr:.1f} ATR di bawah)")
+        bias += 1 if price - sup[0][0] <= 0.7 * atr else 0
+    if res:
+        parts.append(f"resistance {res[0][0]:.5f} ({res[0][1]} sentuhan, {(res[0][0] - price) / atr:.1f} ATR di atas)")
+        bias -= 1 if res[0][0] - price <= 0.7 * atr else 0
+    up_break = [z for z in zones if z[1] >= 2 and C[-4] < z[0] < price]
+    dn_break = [z for z in zones if z[1] >= 2 and C[-4] > z[0] > price]
+    if up_break:
+        parts.append(f"baru breakout di atas {up_break[0][0]:.5f}")
+        bias = 1
+    elif dn_break:
+        parts.append(f"baru breakdown di bawah {dn_break[0][0]:.5f}")
+        bias = -1
+    add("Support / resistance", ", ".join(parts) or "tidak ada level yang jelas", bias)
+
+    # 3. Trendline
+    tl, tb = [], 0
+    if len(lo) >= 2 and lo[-1] - lo[-2] >= 5 and L[lo[-1]] > L[lo[-2]]:
+        i1, i2 = lo[-2], lo[-1]
+        slope = (L[i2] - L[i1]) / (i2 - i1)
+        val = L[i1] + slope * (n - 1 - i1)
+        lines.append({"label": "Trendline naik", "i1": i1, "y1": float(L[i1]), "slope": float(slope), "color": "#22c55e"})
+        if price < val - 0.2 * atr:
+            tl.append(f"trendline naik patah ke bawah (garis di {val:.5f})")
+            tb -= 1
+        elif price - val <= 0.5 * atr:
+            tl.append(f"harga menyentuh trendline naik di {val:.5f}, area pantulan")
+            tb += 1
+        else:
+            tl.append(f"harga di atas trendline naik ({val:.5f}), tren naik terjaga")
+            tb += 1
+    if len(hi) >= 2 and hi[-1] - hi[-2] >= 5 and H[hi[-1]] < H[hi[-2]]:
+        i1, i2 = hi[-2], hi[-1]
+        slope = (H[i2] - H[i1]) / (i2 - i1)
+        val = H[i1] + slope * (n - 1 - i1)
+        lines.append({"label": "Trendline turun", "i1": i1, "y1": float(H[i1]), "slope": float(slope), "color": "#ef4444"})
+        if price > val + 0.2 * atr:
+            tl.append(f"trendline turun ditembus ke atas (garis di {val:.5f}), potensi breakout")
+            tb += 1
+        elif val - price <= 0.5 * atr:
+            tl.append(f"harga menguji trendline turun di {val:.5f}, rawan tertahan")
+            tb -= 1
+        else:
+            tl.append(f"harga di bawah trendline turun ({val:.5f}), tren turun terjaga")
+            tb -= 1
+    add("Trendline", "; ".join(tl) or "tidak ada trendline yang jelas dari swing terakhir", tb)
+
+    # 4. Moving average
+    mp, mb = [], 0
+    if price > r.SMA20 > r.SMA50 > r.EMA200:
+        mp.append("susunan MA naik (harga > SMA20 > SMA50 > EMA200)")
+        mb = 1
+    elif price < r.SMA20 < r.SMA50 < r.EMA200:
+        mp.append("susunan MA turun (harga < SMA20 < SMA50 < EMA200)")
+        mb = -1
+    else:
+        mp.append("susunan MA campur, tren belum searah")
+    s = (d["SMA20"] - d["SMA50"]).tail(6)
+    if s.iloc[0] <= 0 < s.iloc[-1]:
+        mp.append("golden cross SMA20/SMA50 baru terjadi")
+        mb += 1
+    elif s.iloc[0] >= 0 > s.iloc[-1]:
+        mp.append("death cross SMA20/SMA50 baru terjadi")
+        mb -= 1
+    mp.append("SMA50 menanjak" if r.SMA50 > d["SMA50"].iloc[-11] else "SMA50 menurun")
+    if abs(price - r.SMA20) > 2.5 * atr:
+        mp.append("harga jauh dari SMA20, rawan kembali ke rata-rata")
+    add("Moving Average", ", ".join(mp), mb)
+
+    # 5. RSI
+    rsi = d["RSI"].values
+    rp, rbias = [f"RSI {r.RSI:.0f}"], 0
+    if len(lo) >= 2 and lo[-1] > n - 40 and L[lo[-1]] < L[lo[-2]] and rsi[lo[-1]] > rsi[lo[-2]]:
+        rp.append("divergensi bullish (harga lower low, RSI higher low)")
+        rbias = 1
+    elif len(hi) >= 2 and hi[-1] > n - 40 and H[hi[-1]] > H[hi[-2]] and rsi[hi[-1]] < rsi[hi[-2]]:
+        rp.append("divergensi bearish (harga higher high, RSI lower high)")
+        rbias = -1
+    elif r.RSI > 70:
+        rp.append("overbought, rawan koreksi")
+        rbias = -1
+    elif r.RSI < 30:
+        rp.append("oversold, rawan pantulan")
+        rbias = 1
+    else:
+        rp.append("momentum condong naik (di atas 50)" if r.RSI > 50 else "momentum condong turun (di bawah 50)")
+    add("RSI", ", ".join(rp), rbias)
+
+    # 6. Bollinger Bands
+    width = (d["BB_UP"] - d["BB_LO"]) / d["SMA20"]
+    pb = (price - r.BB_LO) / (r.BB_UP - r.BB_LO)
+    bp, bb = [f"%B {pb:.2f}"], 0
+    if width.iloc[-1] <= width.tail(100).quantile(0.2):
+        bp.append("band menyempit (squeeze), siap breakout")
+    if price > r.BB_UP:
+        bp.append("close di luar band atas, overextended")
+        bb = -1
+    elif price < r.BB_LO:
+        bp.append("close di luar band bawah, overextended")
+        bb = 1
+    elif pb > 0.8:
+        bp.append("mendekati band atas")
+    elif pb < 0.2:
+        bp.append("mendekati band bawah")
+    else:
+        bp.append("di sekitar tengah band")
+    add("Bollinger Bands", ", ".join(bp), bb)
+
+    inv = {"Bullish": 1, "Bearish": -1, "Netral": 0}
+    vals = [inv[x["Arah"]] for x in rows]
+    score = sum(vals)
+    verdict = "bullish" if score >= 2 else "bearish" if score <= -2 else "netral / campuran"
+    summary = (f"{verdict} ({vals.count(1)} bullish, {vals.count(-1)} bearish, "
+               f"{vals.count(0)} netral dari {len(vals)} komponen)")
+    return {"rows": rows, "score": score, "total": len(vals), "lines": lines, "summary": summary}
+
+
+def build_chart(df, name, lv=None, tl=None):
     d = df.tail(150)
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.6, 0.2, 0.2],
                         vertical_spacing=0.03)
@@ -679,6 +868,15 @@ def build_chart(df, name, lv=None):
     fig.add_trace(go.Bar(x=d.index, y=d.MACD_HIST, name="MACD hist"), row=3, col=1)
     fig.add_trace(go.Scatter(x=d.index, y=d.MACD, name="MACD", line=dict(width=1)), row=3, col=1)
     fig.add_trace(go.Scatter(x=d.index, y=d.MACD_SIG, name="Signal", line=dict(width=1)), row=3, col=1)
+    if tl:
+        stp = d.index[-1] - d.index[-2]
+        xe = len(d) - 1 + 6
+        for ln in tl:
+            fig.add_shape(type="line", x0=d.index[ln["i1"]], x1=d.index[-1] + stp * 6,
+                          y0=ln["y1"], y1=ln["y1"] + ln["slope"] * (xe - ln["i1"]), row=1, col=1,
+                          line=dict(color=ln["color"], width=1.6, dash="dash"))
+            fig.add_annotation(x=d.index[ln["i1"]], y=ln["y1"], text=ln["label"], showarrow=False,
+                               yshift=-12, font=dict(color=ln["color"], size=11), row=1, col=1)
     if lv:
         step = d.index[-1] - d.index[-2]
         x0, x1 = d.index[-1] - step * 8, d.index[-1] + step * 14
@@ -808,6 +1006,9 @@ def auto_analysis(pair, tf, df, table, verdict, total, n, ctx=None):
         else:
             regime = "pasar cenderung ranging, sinyal tren rawan palsu"
         out += ["", f"**Kekuatan tren.** ADX {adx:.0f}: {regime}."]
+        if ctx.get("tech") and ctx["tech"]["rows"]:
+            reading = " ".join(f"{x['Komponen']}: {x['Temuan']}." for x in ctx["tech"]["rows"])
+            out += ["", f"**Pembacaan grafik.** {reading} Kesimpulan: {ctx['tech']['summary']}."]
         if ctx["mtf"]:
             parts = ", ".join(f"{k}: {v[1]}" for k, v in ctx["mtf"].items())
             d = 1 if total > 0 else -1 if total < 0 else 0
@@ -843,8 +1044,8 @@ with st.sidebar:
     pair = st.selectbox("Pair", list(PAIRS))
     tf = st.selectbox("Timeframe", list(TIMEFRAMES), index=1)
     dark = st.toggle("Tema grafik gelap", value=True)
-    robot_on = st.toggle("Tampilkan robot simulasi", value=False,
-                         help="Opsional. Jika dimatikan, aplikasi murni untuk analisa dan referensi entri manual.")
+    robot_on = st.toggle("Robot simulasi aktif", value=True,
+                         help="Aktif otomatis saat dibuka. Matikan jika hanya ingin analisa tanpa simulasi posisi.")
     lock_chart = st.toggle("Kunci grafik level entri", value=True,
                            help="Mencegah grafik bergeser atau zoom saat Anda menggulir layar di HP.")
     sl_mult = st.slider("Jarak stop loss (× ATR)", 0.5, 3.0, 1.0, 0.1,
@@ -862,7 +1063,7 @@ with st.sidebar:
     news_level = st.selectbox("Tingkat berita", list(IMPORTANCE), index=1)
     news_all = st.toggle("Berita semua mata uang", value=False,
                          help="Matikan untuk hanya menampilkan berita mata uang pair terpilih.")
-    auto = st.toggle("Refresh otomatis tiap 1 menit", value=False,
+    auto = st.toggle("Refresh otomatis tiap 1 menit", value=True,
                      help="Hanya memperbarui panel robot; grafik TradingView sudah real-time.")
     st.button("Muat ulang data", on_click=st.cache_data.clear)
 
@@ -900,6 +1101,7 @@ def analysis_panel():
     mtf = mtf_scores(pair)
     news = load_news()
     nr = news_risk(pair, news)
+    tech = tech_reading(data)
     fx = fx_context(tf)
     d_dir = 1 if total > 0 else -1 if total < 0 else 0
     fxf = currency_factor(pair, d_dir, fx)
@@ -913,7 +1115,7 @@ def analysis_panel():
             fx_note += f" {fxf[2]}."
     score, factors, decision = confidence(total, n, mtf, last.ADX, tv, tv_dir, nr, fxf)
     ctx = {"adx": last.ADX, "mtf": mtf, "pat": candle_pattern(data), "nr": nr,
-           "score": score, "decision": decision, "sl_mult": sl_mult, "rr": rr, "fx_note": fx_note}
+           "score": score, "decision": decision, "sl_mult": sl_mult, "rr": rr, "fx_note": fx_note, "tech": tech}
 
     st.subheader("Keputusan akhir")
     k1, k2 = st.columns([1, 2])
@@ -930,6 +1132,15 @@ def analysis_panel():
             ev = nr["events"][["waktu", "currency", "title", "impact", "forecast", "previous"]]
             ev.columns = ["Waktu (WIB)", "Mata uang", "Berita", "Dampak", "Forecast", "Sebelumnya"]
             st.dataframe(ev, hide_index=True, use_container_width=True)
+
+    st.subheader("Pembacaan teknikal robot")
+    st.caption("Robot membaca candlestick, support/resistance, trendline, Moving Average, RSI, dan Bollinger Bands "
+               f"pada timeframe {tf}.")
+    if tech["rows"]:
+        st.dataframe(pd.DataFrame(tech["rows"]), hide_index=True, use_container_width=True)
+        st.write(f"**Kesimpulan pembacaan grafik:** {tech['summary']}")
+    else:
+        st.info(tech["summary"])
 
     st.subheader("Kekuatan mata uang dan DXY")
     if fx is None:
@@ -965,9 +1176,10 @@ def analysis_panel():
         st.caption(f"Zona merah = risiko (entri ke SL), zona hijau = target (entri ke TP2). Arah: {lv['dir']}.")
     else:
         st.caption("Sinyal netral: tidak ada level entri. Hanya support dan resistance terdekat yang ditampilkan.")
-    st.plotly_chart(build_chart(data, pair, lv), use_container_width=True,
+    st.plotly_chart(build_chart(data, pair, lv, tech["lines"]), use_container_width=True,
                     config={"staticPlot": lock_chart, "displayModeBar": not lock_chart})
 
+    st.caption("Garis putus-putus hijau = trendline naik, merah = trendline turun (dari swing low/high terakhir).")
     st.subheader("Perbandingan dengan sinyal TradingView")
     if tv is None:
         st.info("Ringkasan TradingView tidak tersedia (library tradingview-ta belum terpasang "
