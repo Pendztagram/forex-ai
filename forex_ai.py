@@ -7,6 +7,7 @@ Jalankan: py -m streamlit run forex_ai.py
 import json
 import math
 import urllib.request
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -508,6 +509,160 @@ def lot_panel(pair, lv, price, modal, kurs, risk_pct, units):
                f"3× risiko ({3 * m['risk']:.0f} cent). Margin dan spread belum dihitung.")
 
 
+ROBOT_FILE = Path(__file__).with_name("robot_state.json")
+ROBOT_MAX_OPEN = 3
+ROBOT_COOLDOWN_H = 4
+
+
+def to_utc_iso(ts):
+    ts = pd.Timestamp(ts)
+    ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+    return ts.isoformat()
+
+
+def wib(iso):
+    return pd.Timestamp(iso).tz_convert("Asia/Jakarta").strftime("%d/%m %H:%M")
+
+
+def pos_pnl(p, px):
+    sign = 1 if p["dir"] == "BUY" else -1
+    return p["lot"] * sign * (px - p["entry"]) / p["pip"] * p["pv"]
+
+
+def robot_load(bal0):
+    rs = st.session_state.get("robot")
+    if rs is None:
+        try:
+            rs = json.loads(ROBOT_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            rs = {"bal0": bal0, "open": [], "closed": []}
+        st.session_state["robot"] = rs
+    return rs
+
+
+def robot_save(rs):
+    try:
+        ROBOT_FILE.write_text(json.dumps(rs), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def robot_update(rs):
+    """Cek tiap posisi terbuka terhadap candle setelah entri. Jika SL dan TP di candle sama, dianggap SL."""
+    still = []
+    for p in rs["open"]:
+        try:
+            iv, per, rsmp = TIMEFRAMES[p["tf"]]
+            d = load(PAIRS[p["pair"]], iv, per, rsmp)
+        except Exception:
+            still.append(p)
+            continue
+        if d is None or len(d) == 0:
+            still.append(p)
+            continue
+        t0 = pd.Timestamp(p["opened"])
+        t0 = t0.tz_localize(None) if d.index.tz is None else t0.tz_convert(d.index.tz)
+        hit = None
+        for ts, r in d[d.index > t0].iterrows():
+            buy = p["dir"] == "BUY"
+            if (r.Low <= p["sl"]) if buy else (r.High >= p["sl"]):
+                hit = ("SL", p["sl"], ts)
+                break
+            if (r.High >= p["tp"]) if buy else (r.Low <= p["tp"]):
+                hit = ("TP", p["tp"], ts)
+                break
+        if hit:
+            kind, px, ts = hit
+            rs["closed"].append({**p, "exit": px, "result": kind, "pl": pos_pnl(p, px),
+                                 "closed": to_utc_iso(ts)})
+        else:
+            p["mtm"] = pos_pnl(p, float(d["Close"].iloc[-1]))
+            p["last"] = float(d["Close"].iloc[-1])
+            still.append(p)
+    rs["open"] = still
+
+
+def robot_try_open(rs, pair, tf, decision, lv, price, bal, kurs, risk_pct, units):
+    """Buka posisi virtual bila semua syarat terpenuhi. Mengembalikan teks status."""
+    if "XAU" in pair:
+        return "Emas belum didukung robot (spesifikasi kontrak berbeda tiap broker)."
+    now = pd.Timestamp.now(tz="UTC")
+    today = now.tz_convert("Asia/Jakarta").date()
+    pl_today = sum(t["pl"] for t in rs["closed"]
+                   if pd.Timestamp(t["closed"]).tz_convert("Asia/Jakarta").date() == today)
+    if pl_today <= -3 * bal * risk_pct / 100:
+        return "Batas rugi harian tercapai (3× risiko). Robot istirahat sampai besok."
+    if len(rs["open"]) >= ROBOT_MAX_OPEN:
+        return f"Sudah ada {ROBOT_MAX_OPEN} posisi terbuka (batas maksimum)."
+    if any(p["pair"] == pair for p in rs["open"]):
+        return f"Sudah ada posisi terbuka di {pair}."
+    if any(t["pair"] == pair and (now - pd.Timestamp(t["closed"])).total_seconds() < ROBOT_COOLDOWN_H * 3600
+           for t in rs["closed"]):
+        return f"Jeda {ROBOT_COOLDOWN_H} jam setelah posisi {pair} terakhir ditutup."
+    if decision != "LAYAK ENTRI" or not lv["dir"]:
+        return f"Menunggu sinyal. Keputusan saat ini: {decision}."
+    m = lot_math(pair, lv, price, bal / 100 * kurs, kurs, risk_pct, units)
+    if m["loss"] > 2 * m["risk"]:
+        return "Dilewati: lot minimum terlalu berisiko untuk saldo simulasi ini."
+    rs["open"].append({
+        "id": int(now.timestamp()), "pair": pair, "tf": tf, "dir": lv["dir"],
+        "entry": float(lv["entry"]), "sl": float(lv["sl"]), "tp": float(lv["tp1"]),
+        "lot": m["lot"], "pv": m["pv001"] * 100, "pip": pip_size(pair),
+        "opened": now.isoformat(), "mtm": 0.0, "last": float(price)})
+    return f"Membuka posisi {lv['dir']} {pair} di {price:.5f}, lot {m['lot']:.2f}."
+
+
+def robot_panel(pair, tf, decision, lv, price, modal, kurs, risk_pct, units, active):
+    top = st.columns([4, 1])
+    reset = top[1].button("Reset simulasi")
+    rs = robot_load(modal / kurs * 100)
+    if reset:
+        rs.clear()
+        rs.update({"bal0": modal / kurs * 100, "open": [], "closed": []})
+    robot_update(rs)
+    bal = rs["bal0"] + sum(t["pl"] for t in rs["closed"])
+    status = (robot_try_open(rs, pair, tf, decision, lv, price, bal, kurs, risk_pct, units)
+              if active else "Robot nonaktif. Hidupkan di sidebar.")
+    robot_save(rs)
+    top[0].write(f"**Status robot:** {status}")
+
+    floating = sum(p.get("mtm", 0) for p in rs["open"])
+    pls = [t["pl"] for t in rs["closed"]]
+    wins, losses = [x for x in pls if x > 0], [x for x in pls if x < 0]
+    pf = sum(wins) / abs(sum(losses)) if losses else None
+    rp = lambda c: f"Rp{c / 100 * kurs:,.0f}".replace(",", ".")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Saldo simulasi", f"{bal + floating:.1f} cent", f"≈ {rp(bal + floating)}", delta_color="off")
+    c2.metric("Total P/L tertutup", f"{sum(pls):+.1f} cent")
+    c3.metric("Transaksi / win rate", f"{len(pls)} / {(len(wins) / len(pls) * 100 if pls else 0):.0f}%")
+    c4.metric("Profit factor", "-" if pf is None else f"{pf:.2f}")
+
+    if rs["open"]:
+        st.write("**Posisi terbuka**")
+        st.dataframe(pd.DataFrame([{
+            "Pair": p["pair"], "Arah": p["dir"], "Lot": p["lot"], "Entri": p["entry"], "SL": p["sl"],
+            "TP": p["tp"], "Terakhir": p.get("last"), "P/L (cent)": round(p.get("mtm", 0), 2),
+            "Dibuka (WIB)": wib(p["opened"])} for p in rs["open"]]), hide_index=True, use_container_width=True)
+    if rs["closed"]:
+        closed = sorted(rs["closed"], key=lambda t: t["closed"], reverse=True)
+        jr = pd.DataFrame([{
+            "Ditutup (WIB)": wib(t["closed"]), "Pair": t["pair"], "Arah": t["dir"], "Lot": t["lot"],
+            "Entri": t["entry"], "Keluar": t["exit"], "Hasil": t["result"],
+            "P/L (cent)": round(t["pl"], 2), "P/L (Rp)": round(t["pl"] / 100 * kurs)} for t in closed])
+        st.write("**Jurnal transaksi**")
+        st.dataframe(jr.head(20), hide_index=True, use_container_width=True)
+        eq = [rs["bal0"]]
+        for t in sorted(rs["closed"], key=lambda t: t["closed"]):
+            eq.append(eq[-1] + t["pl"])
+        st.line_chart(pd.DataFrame({"Saldo (cent)": eq}))
+        st.download_button("Unduh jurnal (CSV)", jr.to_csv(index=False), "jurnal_robot.csv", "text/csv")
+    st.caption("Simulasi tanpa spread, komisi, dan slippage. Bila SL dan TP tersentuh di candle yang sama, dihitung kena SL. "
+               "Robot hanya membuka posisi baru untuk pair dan timeframe yang sedang dipilih, dengan syarat keputusan "
+               "LAYAK ENTRI, maksimum 3 posisi, jeda 4 jam per pair, dan berhenti sehari bila rugi 3× risiko. Posisi lama "
+               "tetap dipantau saat Anda berganti pair. Robot hanya bekerja selama halaman ini terbuka; jurnal tersimpan "
+               "di robot_state.json di folder aplikasi (di hosting gratis bisa hilang saat aplikasi restart, jadi unduh CSV-nya).")
+
+
 def build_chart(df, name, lv=None):
     d = df.tail(150)
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.6, 0.2, 0.2],
@@ -688,6 +843,8 @@ with st.sidebar:
     pair = st.selectbox("Pair", list(PAIRS))
     tf = st.selectbox("Timeframe", list(TIMEFRAMES), index=1)
     dark = st.toggle("Tema grafik gelap", value=True)
+    robot_on = st.toggle("Tampilkan robot simulasi", value=False,
+                         help="Opsional. Jika dimatikan, aplikasi murni untuk analisa dan referensi entri manual.")
     lock_chart = st.toggle("Kunci grafik level entri", value=True,
                            help="Mencegah grafik bergeser atau zoom saat Anda menggulir layar di HP.")
     sl_mult = st.slider("Jarak stop loss (× ATR)", 0.5, 3.0, 1.0, 0.1,
@@ -847,9 +1004,14 @@ def analysis_panel():
     st.subheader("Kalkulator lot (akun cent)")
     lot_panel(pair, lv, last.Close, modal, kurs, risk_pct, units)
 
+    if robot_on:
+        st.divider()
+        st.subheader("Robot simulasi (paper trading)")
+        robot_panel(pair, tf, decision, lv, last.Close, modal, kurs, risk_pct, units, robot_on)
+
     st.divider()
     st.subheader("Analisa otomatis")
     st.markdown(auto_analysis(pair, tf, data, table, verdict, total, n, ctx))
 
 
-st.fragment(analysis_panel, run_every=60 if auto else None)()
+st.fragment(analysis_panel, run_every=60 if (auto or robot_on) else None)()
